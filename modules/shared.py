@@ -40,6 +40,7 @@ parser.add_argument("--unload-gfpgan", action='store_true', help="does not do an
 parser.add_argument("--precision", type=str, help="evaluate at this precision", choices=["full", "autocast"], default="autocast")
 parser.add_argument("--share", action='store_true', help="use share=True for gradio and make the UI accessible through their site (doesn't work for me but you might have better luck)")
 parser.add_argument("--ngrok", type=str, help="ngrok authtoken, alternative to gradio --share", default=None)
+parser.add_argument("--ngrok-region", type=str, help="The region in which ngrok should start.", default="us")
 parser.add_argument("--codeformer-models-path", type=str, help="Path to directory with codeformer model file(s).", default=os.path.join(models_path, 'Codeformer'))
 parser.add_argument("--gfpgan-models-path", type=str, help="Path to directory with GFPGAN model file(s).", default=os.path.join(models_path, 'GFPGAN'))
 parser.add_argument("--esrgan-models-path", type=str, help="Path to directory with ESRGAN model file(s).", default=os.path.join(models_path, 'ESRGAN'))
@@ -76,6 +77,16 @@ parser.add_argument("--disable-safe-unpickle", action='store_true', help="disabl
 
 
 cmd_opts = parser.parse_args()
+restricted_opts = [
+    "samples_filename_pattern",
+    "outdir_samples",
+    "outdir_txt2img_samples",
+    "outdir_img2img_samples",
+    "outdir_extras_samples",
+    "outdir_grids",
+    "outdir_txt2img_grids",
+    "outdir_save",
+]
 
 devices.device, devices.device_interrogate, devices.device_gfpgan, devices.device_bsrgan, devices.device_esrgan, devices.device_scunet, devices.device_codeformer = \
 (devices.cpu if any(y in cmd_opts.use_cpu for y in [x, 'all']) else devices.get_optimal_device() for x in ['sd', 'interrogate', 'gfpgan', 'bsrgan', 'esrgan', 'scunet', 'codeformer'])
@@ -218,7 +229,7 @@ options_templates.update(options_section(('upscaling', "Upscaling"), {
     "SWIN_tile_overlap": OptionInfo(8, "Tile overlap, in pixels for SwinIR. Low values = visible seam.", gr.Slider, {"minimum": 0, "maximum": 48, "step": 1}),
     "ldsr_steps": OptionInfo(100, "LDSR processing steps. Lower = faster", gr.Slider, {"minimum": 1, "maximum": 200, "step": 1}),
     "upscaler_for_img2img": OptionInfo(None, "Upscaler for img2img", gr.Dropdown, lambda: {"choices": [x.name for x in sd_upscalers]}),
-    "use_scale_latent_for_hires_fix": OptionInfo(False, "Upscale latent space iamge when doing hires. fix"),
+    "use_scale_latent_for_hires_fix": OptionInfo(False, "Upscale latent space image when doing hires. fix"),
 }))
 
 options_templates.update(options_section(('face-restoration', "Face restoration"), {
