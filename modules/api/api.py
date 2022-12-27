@@ -3,20 +3,25 @@ import io
 import time
 import uvicorn
 from threading import Lock
-from gradio.processing_utils import encode_pil_to_base64, decode_base64_to_file, decode_base64_to_image
+from io import BytesIO
+from gradio.processing_utils import decode_base64_to_file
 from fastapi import APIRouter, Depends, FastAPI, HTTPException
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from secrets import compare_digest
+
 import modules.shared as shared
+from modules import sd_samplers, deepbooru, sd_hijack
 from modules.api.models import *
 from modules.processing import StableDiffusionProcessingTxt2Img, StableDiffusionProcessingImg2Img, process_images
-from modules.sd_samplers import all_samplers
 from modules.extras import run_extras, run_pnginfo
-from PIL import PngImagePlugin
+from modules.textual_inversion.textual_inversion import create_embedding, train_embedding
+from modules.textual_inversion.preprocess import preprocess
+from modules.hypernetworks.hypernetwork import create_hypernetwork, train_hypernetwork
+from PIL import PngImagePlugin,Image
 from modules.sd_models import checkpoints_list
 from modules.realesrgan_model import get_realesrgan_models
+from modules import devices
 from typing import List
-
-if shared.cmd_opts.deepdanbooru:
-    from modules.deepbooru import get_deepbooru_tags
 
 def upscaler_to_index(name: str):
     try:
@@ -25,8 +30,12 @@ def upscaler_to_index(name: str):
         raise HTTPException(status_code=400, detail=f"Invalid upscaler, needs to be on of these: {' , '.join([x.name for x in sd_upscalers])}")
 
 
-sampler_to_index = lambda name: next(filter(lambda row: name.lower() == row[1].name.lower(), enumerate(all_samplers)), None)
+def validate_sampler_name(name):
+    config = sd_samplers.all_samplers_map.get(name, None)
+    if config is None:
+        raise HTTPException(status_code=404, detail="Sampler not found")
 
+    return name
 
 def setUpscalers(req: dict):
     reqDict = vars(req)
@@ -36,6 +45,10 @@ def setUpscalers(req: dict):
     reqDict.pop('upscaler_2')
     return reqDict
 
+def decode_base64_to_image(encoding):
+    if encoding.startswith("data:image/"):
+        encoding = encoding.split(";")[1].split(",")[1]
+    return Image.open(BytesIO(base64.b64decode(encoding)))
 
 def encode_pil_to_base64(image):
     with io.BytesIO() as output_bytes:
@@ -57,43 +70,65 @@ def encode_pil_to_base64(image):
 
 class Api:
     def __init__(self, app: FastAPI, queue_lock: Lock):
+        if shared.cmd_opts.api_auth:
+            self.credentials = dict()
+            for auth in shared.cmd_opts.api_auth.split(","):
+                user, password = auth.split(":")
+                self.credentials[user] = password
+
         self.router = APIRouter()
         self.app = app
         self.queue_lock = queue_lock
-        self.app.add_api_route("/sdapi/v1/txt2img", self.text2imgapi, methods=["POST"], response_model=TextToImageResponse)
-        self.app.add_api_route("/sdapi/v1/img2img", self.img2imgapi, methods=["POST"], response_model=ImageToImageResponse)
-        self.app.add_api_route("/sdapi/v1/extra-single-image", self.extras_single_image_api, methods=["POST"], response_model=ExtrasSingleImageResponse)
-        self.app.add_api_route("/sdapi/v1/extra-batch-images", self.extras_batch_images_api, methods=["POST"], response_model=ExtrasBatchImagesResponse)
-        self.app.add_api_route("/sdapi/v1/png-info", self.pnginfoapi, methods=["POST"], response_model=PNGInfoResponse)
-        self.app.add_api_route("/sdapi/v1/progress", self.progressapi, methods=["GET"], response_model=ProgressResponse)
-        self.app.add_api_route("/sdapi/v1/interrogate", self.interrogateapi, methods=["POST"])
-        self.app.add_api_route("/sdapi/v1/interrupt", self.interruptapi, methods=["POST"])
-        self.app.add_api_route("/sdapi/v1/options", self.get_config, methods=["GET"], response_model=OptionsModel)
-        self.app.add_api_route("/sdapi/v1/options", self.set_config, methods=["POST"])
-        self.app.add_api_route("/sdapi/v1/cmd-flags", self.get_cmd_flags, methods=["GET"], response_model=FlagsModel)
-        self.app.add_api_route("/sdapi/v1/samplers", self.get_samplers, methods=["GET"], response_model=List[SamplerItem])
-        self.app.add_api_route("/sdapi/v1/upscalers", self.get_upscalers, methods=["GET"], response_model=List[UpscalerItem])
-        self.app.add_api_route("/sdapi/v1/sd-models", self.get_sd_models, methods=["GET"], response_model=List[SDModelItem])
-        self.app.add_api_route("/sdapi/v1/hypernetworks", self.get_hypernetworks, methods=["GET"], response_model=List[HypernetworkItem])
-        self.app.add_api_route("/sdapi/v1/face-restorers", self.get_face_restorers, methods=["GET"], response_model=List[FaceRestorerItem])
-        self.app.add_api_route("/sdapi/v1/realesrgan-models", self.get_realesrgan_models, methods=["GET"], response_model=List[RealesrganItem])
-        self.app.add_api_route("/sdapi/v1/prompt-styles", self.get_promp_styles, methods=["GET"], response_model=List[PromptStyleItem])
-        self.app.add_api_route("/sdapi/v1/artist-categories", self.get_artists_categories, methods=["GET"], response_model=List[str])
-        self.app.add_api_route("/sdapi/v1/artists", self.get_artists, methods=["GET"], response_model=List[ArtistItem])
+        self.add_api_route("/sdapi/v1/txt2img", self.text2imgapi, methods=["POST"], response_model=TextToImageResponse)
+        self.add_api_route("/sdapi/v1/img2img", self.img2imgapi, methods=["POST"], response_model=ImageToImageResponse)
+        self.add_api_route("/sdapi/v1/extra-single-image", self.extras_single_image_api, methods=["POST"], response_model=ExtrasSingleImageResponse)
+        self.add_api_route("/sdapi/v1/extra-batch-images", self.extras_batch_images_api, methods=["POST"], response_model=ExtrasBatchImagesResponse)
+        self.add_api_route("/sdapi/v1/png-info", self.pnginfoapi, methods=["POST"], response_model=PNGInfoResponse)
+        self.add_api_route("/sdapi/v1/progress", self.progressapi, methods=["GET"], response_model=ProgressResponse)
+        self.add_api_route("/sdapi/v1/interrogate", self.interrogateapi, methods=["POST"])
+        self.add_api_route("/sdapi/v1/interrupt", self.interruptapi, methods=["POST"])
+        self.add_api_route("/sdapi/v1/skip", self.skip, methods=["POST"])
+        self.add_api_route("/sdapi/v1/options", self.get_config, methods=["GET"], response_model=OptionsModel)
+        self.add_api_route("/sdapi/v1/options", self.set_config, methods=["POST"])
+        self.add_api_route("/sdapi/v1/cmd-flags", self.get_cmd_flags, methods=["GET"], response_model=FlagsModel)
+        self.add_api_route("/sdapi/v1/samplers", self.get_samplers, methods=["GET"], response_model=List[SamplerItem])
+        self.add_api_route("/sdapi/v1/upscalers", self.get_upscalers, methods=["GET"], response_model=List[UpscalerItem])
+        self.add_api_route("/sdapi/v1/sd-models", self.get_sd_models, methods=["GET"], response_model=List[SDModelItem])
+        self.add_api_route("/sdapi/v1/hypernetworks", self.get_hypernetworks, methods=["GET"], response_model=List[HypernetworkItem])
+        self.add_api_route("/sdapi/v1/face-restorers", self.get_face_restorers, methods=["GET"], response_model=List[FaceRestorerItem])
+        self.add_api_route("/sdapi/v1/realesrgan-models", self.get_realesrgan_models, methods=["GET"], response_model=List[RealesrganItem])
+        self.add_api_route("/sdapi/v1/prompt-styles", self.get_prompt_styles, methods=["GET"], response_model=List[PromptStyleItem])
+        self.add_api_route("/sdapi/v1/artist-categories", self.get_artists_categories, methods=["GET"], response_model=List[str])
+        self.add_api_route("/sdapi/v1/artists", self.get_artists, methods=["GET"], response_model=List[ArtistItem])
+        self.add_api_route("/sdapi/v1/refresh-checkpoints", self.refresh_checkpoints, methods=["POST"])
+        self.add_api_route("/sdapi/v1/create/embedding", self.create_embedding, methods=["POST"], response_model=CreateResponse)
+        self.add_api_route("/sdapi/v1/create/hypernetwork", self.create_hypernetwork, methods=["POST"], response_model=CreateResponse)
+        self.add_api_route("/sdapi/v1/preprocess", self.preprocess, methods=["POST"], response_model=PreprocessResponse)
+        self.add_api_route("/sdapi/v1/train/embedding", self.train_embedding, methods=["POST"], response_model=TrainResponse)
+        self.add_api_route("/sdapi/v1/train/hypernetwork", self.train_hypernetwork, methods=["POST"], response_model=TrainResponse)
+
+    def add_api_route(self, path: str, endpoint, **kwargs):
+        if shared.cmd_opts.api_auth:
+            return self.app.add_api_route(path, endpoint, dependencies=[Depends(self.auth)], **kwargs)
+        return self.app.add_api_route(path, endpoint, **kwargs)
+
+    def auth(self, credentials: HTTPBasicCredentials = Depends(HTTPBasic())):
+        if credentials.username in self.credentials:
+            if compare_digest(credentials.password, self.credentials[credentials.username]):
+                return True
+
+        raise HTTPException(status_code=401, detail="Incorrect username or password", headers={"WWW-Authenticate": "Basic"})
 
     def text2imgapi(self, txt2imgreq: StableDiffusionTxt2ImgProcessingAPI):
-        sampler_index = sampler_to_index(txt2imgreq.sampler_index)
-
-        if sampler_index is None:
-            raise HTTPException(status_code=404, detail="Sampler not found")
-
         populate = txt2imgreq.copy(update={ # Override __init__ params
             "sd_model": shared.sd_model,
-            "sampler_index": sampler_index[0],
+            "sampler_name": validate_sampler_name(txt2imgreq.sampler_name or txt2imgreq.sampler_index),
             "do_not_save_samples": True,
             "do_not_save_grid": True
             }
         )
+        if populate.sampler_name:
+            populate.sampler_index = None  # prevent a warning later on
         p = StableDiffusionProcessingTxt2Img(**vars(populate))
         # Override object param
 
@@ -109,12 +144,6 @@ class Api:
         return TextToImageResponse(images=b64images, parameters=vars(txt2imgreq), info=processed.js())
 
     def img2imgapi(self, img2imgreq: StableDiffusionImg2ImgProcessingAPI):
-        sampler_index = sampler_to_index(img2imgreq.sampler_index)
-
-        if sampler_index is None:
-            raise HTTPException(status_code=404, detail="Sampler not found")
-
-
         init_images = img2imgreq.init_images
         if init_images is None:
             raise HTTPException(status_code=404, detail="Init image not found")
@@ -123,23 +152,22 @@ class Api:
         if mask:
             mask = decode_base64_to_image(mask)
 
-
         populate = img2imgreq.copy(update={ # Override __init__ params
             "sd_model": shared.sd_model,
-            "sampler_index": sampler_index[0],
+            "sampler_name": validate_sampler_name(img2imgreq.sampler_name or img2imgreq.sampler_index),
             "do_not_save_samples": True,
             "do_not_save_grid": True,
             "mask": mask
             }
         )
-        p = StableDiffusionProcessingImg2Img(**vars(populate))
+        if populate.sampler_name:
+            populate.sampler_index = None  # prevent a warning later on
 
-        imgs = []
-        for img in init_images:
-            img = decode_base64_to_image(img)
-            imgs = [img] * p.batch_size
+        args = vars(populate)
+        args.pop('include_init_images', None)  # this is meant to be done by "exclude": True in model, but it's for a reason that I cannot determine.
+        p = StableDiffusionProcessingImg2Img(**args)
 
-        p.init_images = imgs
+        p.init_images = [decode_base64_to_image(x) for x in init_images]
 
         shared.state.begin()
 
@@ -150,7 +178,7 @@ class Api:
 
         b64images = list(map(encode_pil_to_base64, processed.images))
 
-        if (not img2imgreq.include_init_images):
+        if not img2imgreq.include_init_images:
             img2imgreq.init_images = None
             img2imgreq.mask = None
 
@@ -162,7 +190,7 @@ class Api:
         reqDict['image'] = decode_base64_to_image(reqDict['image'])
 
         with self.queue_lock:
-            result = run_extras(extras_mode=0, image_folder="", input_dir="", output_dir="", **reqDict)
+            result = run_extras(extras_mode=0, image_folder="", input_dir="", output_dir="", save_output=False, **reqDict)
 
         return ExtrasSingleImageResponse(image=encode_pil_to_base64(result[0][0]), html_info=result[1])
 
@@ -178,7 +206,7 @@ class Api:
         reqDict.pop('imageList')
 
         with self.queue_lock:
-            result = run_extras(extras_mode=1, image="", input_dir="", output_dir="", **reqDict)
+            result = run_extras(extras_mode=1, image="", input_dir="", output_dir="", save_output=False, **reqDict)
 
         return ExtrasBatchImagesResponse(images=list(map(encode_pil_to_base64, result[0])), html_info=result[1])
 
@@ -221,7 +249,7 @@ class Api:
     def interrogateapi(self, interrogatereq: InterrogateRequest):
         image_b64 = interrogatereq.image
         if image_b64 is None:
-            raise HTTPException(status_code=404, detail="Image not found") 
+            raise HTTPException(status_code=404, detail="Image not found")
 
         img = decode_base64_to_image(image_b64)
         img = img.convert('RGB')
@@ -231,19 +259,19 @@ class Api:
             if interrogatereq.model == "clip":
                 processed = shared.interrogator.interrogate(img)
             elif interrogatereq.model == "deepdanbooru":
-                if shared.cmd_opts.deepdanbooru:
-                    processed = get_deepbooru_tags(img)
-                else:
-                    raise HTTPException(status_code=404, detail="Model not found. Add --deepdanbooru when launching for using the model.")
+                processed = deepbooru.model.tag(img)
             else:
                 raise HTTPException(status_code=404, detail="Model not found")
-        
+
         return InterrogateResponse(caption=processed)
 
     def interruptapi(self):
         shared.state.interrupt()
 
         return {}
+
+    def skip(self):
+        shared.state.skip()
 
     def get_config(self):
         options = {}
@@ -256,14 +284,9 @@ class Api:
 
         return options
 
-    def set_config(self, req: OptionsModel):
-        # currently req has all options fields even if you send a dict like { "send_seed": false }, which means it will
-        # overwrite all options with default values.
-        raise RuntimeError('Setting options via API is not supported')
-
-        reqDict = vars(req)
-        for o in reqDict:
-            setattr(shared.opts, o, reqDict[o])
+    def set_config(self, req: Dict[str, Any]):
+        for k, v in req.items():
+            shared.opts.set(k, v)
 
         shared.opts.save(shared.config_filename)
         return
@@ -272,7 +295,7 @@ class Api:
         return vars(shared.cmd_opts)
 
     def get_samplers(self):
-        return [{"name":sampler[0], "aliases":sampler[2], "options":sampler[3]} for sampler in all_samplers]
+        return [{"name": sampler[0], "aliases":sampler[2], "options":sampler[3]} for sampler in sd_samplers.all_samplers]
 
     def get_upscalers(self):
         upscalers = []
@@ -295,11 +318,11 @@ class Api:
     def get_realesrgan_models(self):
         return [{"name":x.name,"path":x.data_path, "scale":x.scale} for x in get_realesrgan_models(None)]
 
-    def get_promp_styles(self):
+    def get_prompt_styles(self):
         styleList = []
         for k in shared.prompt_styles.styles:
             style = shared.prompt_styles.styles[k]
-            styleList.append({"name":style[0], "prompt": style[1], "negative_prompr": style[2]})
+            styleList.append({"name":style[0], "prompt": style[1], "negative_prompt": style[2]})
 
         return styleList
 
@@ -308,6 +331,92 @@ class Api:
 
     def get_artists(self):
         return [{"name":x[0], "score":x[1], "category":x[2]} for x in shared.artist_db.artists]
+
+    def refresh_checkpoints(self):
+        shared.refresh_checkpoints()
+
+    def create_embedding(self, args: dict):
+        try:
+            shared.state.begin()
+            filename = create_embedding(**args) # create empty embedding
+            sd_hijack.model_hijack.embedding_db.load_textual_inversion_embeddings() # reload embeddings so new one can be immediately used
+            shared.state.end()
+            return CreateResponse(info = "create embedding filename: {filename}".format(filename = filename))
+        except AssertionError as e:
+            shared.state.end()
+            return TrainResponse(info = "create embedding error: {error}".format(error = e))
+
+    def create_hypernetwork(self, args: dict):
+        try:
+            shared.state.begin()
+            filename = create_hypernetwork(**args) # create empty embedding
+            shared.state.end()
+            return CreateResponse(info = "create hypernetwork filename: {filename}".format(filename = filename))
+        except AssertionError as e:
+            shared.state.end()
+            return TrainResponse(info = "create hypernetwork error: {error}".format(error = e))
+
+    def preprocess(self, args: dict):
+        try:
+            shared.state.begin()
+            preprocess(**args) # quick operation unless blip/booru interrogation is enabled
+            shared.state.end()
+            return PreprocessResponse(info = 'preprocess complete')
+        except KeyError as e:
+            shared.state.end()
+            return PreprocessResponse(info = "preprocess error: invalid token: {error}".format(error = e))
+        except AssertionError as e:
+            shared.state.end()
+            return PreprocessResponse(info = "preprocess error: {error}".format(error = e))
+        except FileNotFoundError as e:
+            shared.state.end()
+            return PreprocessResponse(info = 'preprocess error: {error}'.format(error = e))
+
+    def train_embedding(self, args: dict):
+        try:
+            shared.state.begin()
+            apply_optimizations = shared.opts.training_xattention_optimizations
+            error = None
+            filename = ''
+            if not apply_optimizations:
+                sd_hijack.undo_optimizations()
+            try:
+                embedding, filename = train_embedding(**args) # can take a long time to complete
+            except Exception as e:
+                error = e
+            finally:
+                if not apply_optimizations:
+                    sd_hijack.apply_optimizations()
+                shared.state.end()
+            return TrainResponse(info = "train embedding complete: filename: {filename} error: {error}".format(filename = filename, error = error))
+        except AssertionError as msg:
+            shared.state.end()
+            return TrainResponse(info = "train embedding error: {msg}".format(msg = msg))
+
+    def train_hypernetwork(self, args: dict):
+        try:
+            shared.state.begin()
+            initial_hypernetwork = shared.loaded_hypernetwork
+            apply_optimizations = shared.opts.training_xattention_optimizations
+            error = None
+            filename = ''
+            if not apply_optimizations:
+                sd_hijack.undo_optimizations()
+            try:
+                hypernetwork, filename = train_hypernetwork(*args)
+            except Exception as e:
+                error = e
+            finally:
+                shared.loaded_hypernetwork = initial_hypernetwork
+                shared.sd_model.cond_stage_model.to(devices.device)
+                shared.sd_model.first_stage_model.to(devices.device)
+                if not apply_optimizations:
+                    sd_hijack.apply_optimizations()
+                shared.state.end()
+            return TrainResponse(info = "train embedding complete: filename: {filename} error: {error}".format(filename = filename, error = error))
+        except AssertionError as msg:
+            shared.state.end()
+            return TrainResponse(info = "train embedding error: {error}".format(error = error))
 
     def launch(self, server_name, port):
         self.app.include_router(self.router)
